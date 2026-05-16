@@ -12,6 +12,8 @@ var __wx_channels_tip__ = {};
 var __wx_channels_cur_video = null;
 var __wx_channels_store__ = {
   profile: null,
+  rawFeed: null,
+  rawProfile: null,
   buffers: [],
   keys: {},
 };
@@ -71,8 +73,8 @@ var WXU = (() => {
       (() => {
         const variable = keys[i];
         const methods = variables[variable];
-        // 检查是否包含 finderGetCommentDetail 函数（API 组）
-        if (typeof methods.finderGetCommentDetail === "function") {
+        // 检查是否包含评论/详情 API 函数（API 组）
+        if (typeof methods.finderGetCommentDetail === "function" || typeof methods.finderGetCommentList === "function") {
           WXAPI = methods;
           console.log('[WXU] ✅ WXAPI 已初始化，包含函数:', Object.keys(methods).slice(0, 10));
           return;
@@ -195,6 +197,8 @@ var WXU = (() => {
         nonce_id: feed.objectNonceId,
         title: clean_html_tags(feed.objectDesc.description),
         url: media.url + media.urlToken,
+        originalUrl: media.url,
+        urlToken: media.urlToken || "",
         key: media.decodeKey,
         cover_url: media.coverUrl,
         coverUrl: media.thumbUrl,
@@ -328,6 +332,8 @@ var WXU = (() => {
         body: JSON.stringify(profile),
       });
       __wx_channels_store__.profile = profile;
+      __wx_channels_store__.rawFeed = feed;
+      __wx_channels_store__.rawProfile = profile;
       fetch("/__wx_channels_api/tip", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

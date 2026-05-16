@@ -26,6 +26,7 @@ import (
 // BatchHandler 批量下载处理器
 type BatchHandler struct {
 	downloadService *services.DownloadRecordService
+	settingsRepo    *database.SettingsRepository
 	gopeedService   *services.GopeedService // Injected Gopeed Service
 	mu              sync.RWMutex
 	tasks           []BatchTask
@@ -140,6 +141,7 @@ func (t *BatchTask) GetCover() string {
 func NewBatchHandler(cfg *config.Config, gopeedService *services.GopeedService) *BatchHandler {
 	return &BatchHandler{
 		downloadService: services.NewDownloadRecordService(),
+		settingsRepo:    database.NewSettingsRepository(),
 		gopeedService:   gopeedService,
 		tasks:           make([]BatchTask, 0),
 	}
@@ -235,8 +237,6 @@ func (h *BatchHandler) HandleBatchStart(Conn *SunnyNet.HttpConn) bool {
 				pageSource = "batch_home"
 			} else if strings.Contains(referer, "/web/pages/profile") {
 				pageSource = "batch_profile"
-			} else if strings.Contains(referer, "/web/pages/s") {
-				pageSource = "batch_search" // 搜索页面批量下载
 			} else {
 				pageSource = "batch_channels" // 默认标记为视频号批量下载
 			}
@@ -434,18 +434,20 @@ func (h *BatchHandler) downloadVideo(ctx context.Context, task *BatchTask, downl
 		return fmt.Errorf("创建作者目录失败: %v", err)
 	}
 
-	// 优先使用视频ID进行去重检查（如果提供了视频ID）
+	settings, err := h.settingsRepo.Load()
+	if err != nil {
+		utils.Warn("加载下载命名设置失败，继续使用默认命名策略: %v", err)
+	}
+	includeVideoID := true
+	if settings != nil {
+		includeVideoID = settings.DownloadFilenameWithVideoID
+	}
+
 	if !forceRedownload && task.ID != "" && h.downloadService != nil {
-		if exists, err := h.downloadService.GetByID(task.ID); err == nil && exists != nil {
-			// DB记录中已存在该视频ID，说明已下载过，尝试查找文件
-			// 使用包含ID的文件名查找
-			filenameWithID := utils.GenerateVideoFilename(task.Title, task.ID)
-			filenameWithID = utils.EnsureExtension(filenameWithID, ".mp4")
-			filePathWithID := filepath.Join(savePath, filenameWithID)
-			if _, err := os.Stat(filePathWithID); err == nil {
-				utils.Info("⏭️ [批量下载] 视频ID已存在记录中，文件已存在，跳过: ID=%s, 文件名=%s", task.ID, filenameWithID)
-				// 文件已存在也保存记录（标记为已完成）
-				h.saveDownloadRecord(task, filePathWithID, "completed")
+		if exists, err := h.downloadService.GetByID(task.ID); err == nil && exists != nil && exists.FilePath != "" {
+			if _, statErr := os.Stat(exists.FilePath); statErr == nil {
+				utils.Info("⏭️ [批量下载] 视频已存在，跳过: ID=%s", task.ID)
+				h.saveDownloadRecord(task, exists.FilePath, "completed")
 				return nil
 			}
 		}
@@ -453,12 +455,11 @@ func (h *BatchHandler) downloadVideo(ctx context.Context, task *BatchTask, downl
 		utils.Warn("downloadService is nil, skipping DB check")
 	}
 
-	// 生成文件名：优先使用视频ID确保唯一性
-	cleanFilename := utils.GenerateVideoFilename(task.Title, task.ID)
+	// 生成文件名：默认仅使用标题，可由设置项打开视频ID
+	cleanFilename := utils.GenerateVideoFilename(task.Title, task.ID, includeVideoID)
 	cleanFilename = utils.EnsureExtension(cleanFilename, ".mp4")
 	filePath := filepath.Join(savePath, cleanFilename)
 
-	// 检查文件是否已存在（作为备用检查，主要检查已通过ID完成）
 	if !forceRedownload {
 		if _, err := os.Stat(filePath); err == nil {
 			utils.Info("⏭️ [批量下载] 文件已存在，跳过: %s", cleanFilename)
@@ -466,6 +467,7 @@ func (h *BatchHandler) downloadVideo(ctx context.Context, task *BatchTask, downl
 			h.saveDownloadRecord(task, filePath, "completed")
 			return nil
 		}
+		filePath = utils.GenerateUniquePath(savePath, cleanFilename)
 	}
 
 	// 使用配置的重试次数
@@ -568,10 +570,10 @@ func (h *BatchHandler) downloadVideoOnce(ctx context.Context, task *BatchTask, f
 				if total > 0 {
 					task.SizeMB = fmt.Sprintf("%.2fMB", task.TotalMB)
 				}
-				
+
 				// 每10%输出一次日志
 				if int(task.Progress)%10 == 0 && task.Progress > 0 {
-					utils.Info("📊 [批量下载] %s 进度: %.1f%% (%.2f/%.2f MB)", 
+					utils.Info("📊 [批量下载] %s 进度: %.1f%% (%.2f/%.2f MB)",
 						task.Title, task.Progress, task.DownloadedMB, task.TotalMB)
 				}
 			}
@@ -584,7 +586,7 @@ func (h *BatchHandler) downloadVideoOnce(ctx context.Context, task *BatchTask, f
 		connections = h.getConfig().DownloadConnections
 	}
 
-	err := h.gopeedService.DownloadSync(ctx, task.URL, filePath, connections, onProgress)
+	err := h.gopeedService.DownloadSync(ctx, task.URL, filePath, connections, nil, onProgress)
 	if err != nil {
 		return err
 	}

@@ -127,13 +127,6 @@ function __show_batch_download_ui__(videos, title) {
     if (liveCount > 0) {
       statsText += ', ' + liveCount + ' 个直播';
     }
-  } else if (currentPath.includes('/pages/s')) {
-    // 搜索页：显示"X 个动态, Y 个直播"
-    if (liveCount > 0) {
-      statsText = videoCount + ' 个动态, ' + liveCount + ' 个直播';
-    } else {
-      statsText = videoCount + ' 个动态';
-    }
   } else if (currentPath.includes('/pages/profile')) {
     // Profile页：显示"X 个视频, Y 个直播回放"
     if (liveCount > 0) {
@@ -509,13 +502,6 @@ function __update_batch_download_ui__(videos, title) {
       if (liveCount > 0) {
         statsText += ', ' + liveCount + ' 个直播';
       }
-    } else if (currentPath.includes('/pages/s')) {
-      // 搜索页：显示"X 个动态, Y 个直播"
-      if (liveCount > 0) {
-        statsText = videoCount + ' 个动态, ' + liveCount + ' 个直播';
-      } else {
-        statsText = videoCount + ' 个动态';
-      }
     } else if (currentPath.includes('/pages/profile')) {
       // Profile页：显示"X 个视频, Y 个直播回放"
       if (liveCount > 0) {
@@ -830,23 +816,27 @@ async function __batch_download_selected__() {
     // 构建批量下载请求数据
     var batchVideos = formattedVideos.map(function(video) {
       var authorName = video.nickname || (video.contact && video.contact.nickname) || '未知作者';
-      var resolution = '';
-      var width = 0, height = 0;
-
-      if (video.spec && video.spec.length > 0) {
-        var firstSpec = video.spec[0];
-        width = firstSpec.width || 0;
-        height = firstSpec.height || 0;
-        resolution = width && height ? (width + 'x' + height) : '';
-      }
+      var normalizedDownload = typeof __wx_channels_normalize_video_download__ === 'function'
+        ? __wx_channels_normalize_video_download__(video, null)
+        : {
+          mode: 'original',
+          url: video.url || '',
+          resolution: '',
+          width: 0,
+          height: 0,
+          fileFormat: ''
+        };
 
       return {
         id: video.id || '',
-        url: video.url || '',
+        url: normalizedDownload.url || video.url || '',
         title: video.title || video.id || String(Date.now()),
         author: authorName,
         key: video.key || '',
-        resolution: resolution
+        resolution: normalizedDownload.resolution || '',
+        width: normalizedDownload.width || 0,
+        height: normalizedDownload.height || 0,
+        fileFormat: normalizedDownload.fileFormat || ''
       };
     });
 

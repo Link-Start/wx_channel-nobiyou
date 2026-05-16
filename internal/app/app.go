@@ -53,7 +53,6 @@ type App struct {
 	RecordHandler     *handlers.RecordHandler
 	ScriptHandler     *handlers.ScriptHandler
 	BatchHandler      *handlers.BatchHandler
-	CommentHandler    *handlers.CommentHandler
 	ConsoleAPIHandler *handlers.ConsoleAPIHandler
 	WebSocketHandler  *handlers.WebSocketHandler
 	StaticFileHandler *handlers.StaticFileHandler
@@ -207,7 +206,6 @@ func (app *App) Run() {
 	app.APIHandler = handlers.NewAPIHandler(app.Cfg)
 	app.UploadHandler = handlers.NewUploadHandler(app.Cfg, app.WSHub, app.GopeedService)
 	app.RecordHandler = handlers.NewRecordHandler(app.Cfg)
-	app.CommentHandler = handlers.NewCommentHandler(app.Cfg)
 
 	// BatchHandler (Injecting GopeedService)
 	app.BatchHandler = handlers.NewBatchHandler(app.Cfg, app.GopeedService)
@@ -221,7 +219,6 @@ func (app *App) Run() {
 		assets.HomeJS,
 		assets.FeedJS,
 		assets.ProfileJS,
-		assets.SearchJS,
 		assets.BatchDownloadJS,
 		assets.ZipJS,
 		assets.FileSaverJS,
@@ -241,7 +238,6 @@ func (app *App) Run() {
 		app.UploadHandler,
 		app.RecordHandler,
 		app.BatchHandler,
-		app.CommentHandler,
 	}
 	app.responseInterceptors = []router.Interceptor{
 		app.ScriptHandler,
@@ -440,7 +436,6 @@ func (app *App) printEnvConfig() {
 			utils.PrintLabelValue("📊", "日志最大大小", fmt.Sprintf("%d MB", app.Cfg.MaxLogSizeMB))
 		}
 		utils.PrintLabelValue("💾", "保存页面快照", fmt.Sprintf("%v", app.Cfg.SavePageSnapshot))
-		utils.PrintLabelValue("🔍", "保存搜索数据", fmt.Sprintf("%v", app.Cfg.SaveSearchData))
 		utils.PrintLabelValue("📄", "保存JS文件", fmt.Sprintf("%v", app.Cfg.SavePageJS))
 		utils.PrintLabelValue("🖼️", "显示日志按钮", fmt.Sprintf("%v", app.Cfg.ShowLogButton))
 		utils.PrintLabelValue("📤", "分片上传并发", app.Cfg.UploadChunkConcurrency)
@@ -464,10 +459,9 @@ func (app *App) printTitle() {
 	color.Yellow("    微信视频号下载助手 v%s", app.Cfg.Version)
 	color.Yellow("    项目地址：https://github.com/nobiyou/wx_channel")
 	color.Green("    v%s 更新要点：", app.Cfg.Version)
-	color.Green("    • 详情页修复 - 兼容 Home 路径下的分享视频与个人页直达视频")
-	color.Green("    • 下载恢复 - 修复直达视频已拿到信息但下载按钮灰色不可用")
-	color.Green("    • 评论恢复 - 修复详情页模式下评论采集功能未就绪的问题")
-	color.Green("    • 稳定延续 - 延续新版页面、Hub 与雷达开关的适配优化")
+	color.Green("    • 原始视频下载 - 完善原始视频下载链路，修复获取不到原始视频链接的问题")
+	color.Green("    • 评论导出优化 - 新增评论列表API，支持获取视频评论列表和回复分页")
+	color.Green("    • 下载命名优化 - 默认不再附带视频 ID，同名自动追加序号")
 	fmt.Println()
 }
 
