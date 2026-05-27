@@ -87,6 +87,14 @@ window.__wx_batch_download_manager__ = {
   }
 };
 
+function __wx_channels_batch_api_headers__() {
+  var headers = { 'Content-Type': 'application/json' };
+  if (window.__WX_LOCAL_TOKEN__) {
+    headers['X-Local-Auth'] = window.__WX_LOCAL_TOKEN__;
+  }
+  return headers;
+}
+
 // ==================== 显示批量下载弹窗 ====================
 function __show_batch_download_ui__(videos, title) {
   if (!videos || videos.length === 0) {
@@ -746,6 +754,25 @@ function __update_batch_ui__() {
   }
 }
 
+function __format_batch_create_time__(unixSeconds) {
+  if (!unixSeconds) {
+    return '';
+  }
+  var date = new Date(unixSeconds * 1000);
+  var pad = function(value) {
+    return value < 10 ? '0' + value : String(value);
+  };
+  return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) +
+    ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds());
+}
+
+function __format_batch_size_mb__(bytes) {
+  if (!bytes) {
+    return '';
+  }
+  return (bytes / (1024 * 1024)).toFixed(2) + 'MB';
+}
+
 // ==================== 批量下载 ====================
 async function __batch_download_selected__() {
   var selectedVideos = __wx_batch_download_manager__.getSelectedVideos();
@@ -832,18 +859,28 @@ async function __batch_download_selected__() {
         url: normalizedDownload.url || video.url || '',
         title: video.title || video.id || String(Date.now()),
         author: authorName,
+        headers: {
+          Referer: location.href,
+          Origin: location.origin || 'https://channels.weixin.qq.com'
+        },
+        userAgent: navigator.userAgent || '',
+        sourceUrl: location.href,
         key: video.key || '',
         resolution: normalizedDownload.resolution || '',
         width: normalizedDownload.width || 0,
         height: normalizedDownload.height || 0,
-        fileFormat: normalizedDownload.fileFormat || ''
+        fileFormat: normalizedDownload.fileFormat || '',
+        durationMs: video.duration || 0,
+        size: video.size || 0,
+        sizeMB: __format_batch_size_mb__(video.size || 0),
+        createTime: __format_batch_create_time__(video.createtime || 0)
       };
     });
 
     // 调用后端批量下载接口
     var response = await fetch('/__wx_channels_api/batch_start', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: __wx_channels_batch_api_headers__(),
       body: JSON.stringify({
         videos: batchVideos,
         forceRedownload: __wx_batch_download_manager__.forceRedownload
@@ -871,7 +908,7 @@ async function __batch_download_selected__() {
     try {
       var progressRes = await fetch('/__wx_channels_api/batch_progress', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
+        headers: __wx_channels_batch_api_headers__()
       });
       if (progressRes.ok) {
         var progressData = await progressRes.json();
@@ -902,7 +939,7 @@ async function __batch_download_selected__() {
         try {
           await fetch('/__wx_channels_api/batch_cancel', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' }
+            headers: __wx_channels_batch_api_headers__()
           });
           __wx_log({ msg: '⏹️ 批量下载已取消' });
         } catch (e) {
@@ -915,7 +952,7 @@ async function __batch_download_selected__() {
       try {
         var progressRes = await fetch('/__wx_channels_api/batch_progress', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' }
+          headers: __wx_channels_batch_api_headers__()
         });
 
         if (progressRes.ok) {

@@ -8,8 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/url"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -123,31 +123,35 @@ func compactOriginalVideoURL(raw string) string {
 	return cleaned.String()
 }
 
-func downloadModeFromRequest(req DownloadVideoRequest) downloadVideoMode {
-	if isOriginalVideoURL(req.VideoURL) {
-		return downloadVideoModeOriginal
+func NormalizeDownloadURL(videoURL string, fileFormat string) (string, downloadVideoMode) {
+	if isOriginalVideoURL(videoURL) {
+		return compactOriginalVideoURL(videoURL), downloadVideoModeOriginal
 	}
-	if strings.TrimSpace(req.FileFormat) != "" {
-		return downloadVideoModeSpecific
+	if strings.TrimSpace(fileFormat) != "" || hasSpecificVideoSpec(videoURL) {
+		return videoURL, downloadVideoModeSpecific
 	}
-	if hasSpecificVideoSpec(req.VideoURL) {
-		return downloadVideoModeSpecific
-	}
-	return downloadVideoModeOriginal
+	return compactOriginalVideoURL(videoURL), downloadVideoModeOriginal
 }
 
-func normalizeDownloadVideoURL(req DownloadVideoRequest) string {
-	if downloadModeFromRequest(req) != downloadVideoModeOriginal {
-		return req.VideoURL
-	}
-	return compactOriginalVideoURL(req.VideoURL)
-}
-
-func downloadConnectionCountFromMode(base int, mode downloadVideoMode) int {
+func ResolveDownloadConnections(mode downloadVideoMode, base int) int {
 	if mode == downloadVideoModeOriginal {
 		return 1
 	}
 	return base
+}
+
+func downloadModeFromRequest(req DownloadVideoRequest) downloadVideoMode {
+	_, mode := NormalizeDownloadURL(req.VideoURL, req.FileFormat)
+	return mode
+}
+
+func normalizeDownloadVideoURL(req DownloadVideoRequest) string {
+	normalized, _ := NormalizeDownloadURL(req.VideoURL, req.FileFormat)
+	return normalized
+}
+
+func downloadConnectionCountFromMode(base int, mode downloadVideoMode) int {
+	return ResolveDownloadConnections(mode, base)
 }
 
 func (h *UploadHandler) downloadWithHeaders(ctx context.Context, url, targetPath string, headers map[string]string, onProgress func(progress float64, downloaded int64, total int64)) error {
@@ -1254,9 +1258,17 @@ func (h *UploadHandler) HandleDownloadVideo(Conn *SunnyNet.HttpConn) bool {
 	if settings != nil {
 		includeVideoID = settings.DownloadFilenameWithVideoID
 	}
+	filenameTemplate := ""
+	if cfg := h.getConfig(); cfg != nil {
+		filenameTemplate = cfg.DownloadFilenameTemplate
+	}
 
-	// 生成文件名：默认仅使用标题；如需避免同名冲突则在落盘前追加序号
-	filename := utils.GenerateVideoFilename(req.Title, req.VideoID, includeVideoID)
+	// 生成文件名：默认仅使用标题；如配置模板，则优先按模板渲染。
+	filename := utils.BuildVideoFilename(utils.VideoFilenameMeta{
+		Title:   req.Title,
+		VideoID: req.VideoID,
+		Author:  req.Author,
+	}, includeVideoID, filenameTemplate)
 
 	// 检查文件名中是否已经包含分辨率信息（避免重复添加）
 	hasResolutionInFilename := false
