@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -20,8 +21,11 @@ import (
 	"wx_channel/internal/services"
 	"wx_channel/internal/utils"
 
+	"github.com/GopeedLab/gopeed/pkg/base"
 	"github.com/qtgolang/SunnyNet/SunnyNet"
 )
+
+var errBatchPaused = errors.New("batch download paused")
 
 // BatchHandler 批量下载处理器
 type BatchHandler struct {
@@ -73,6 +77,9 @@ type BatchTask struct {
 	DecryptKey string `json:"decryptKey,omitempty"` // 解密密钥（数据库格式）
 	DurationMs int64  `json:"durationMs,omitempty"` // 时长毫秒（数据库格式，字段名为duration但类型是int64）
 	Size       int64  `json:"size,omitempty"`       // 大小字节（数据库格式）
+	GopeedTaskID string `json:"-"`
+	TempPath     string `json:"-"`
+	FinalPath    string `json:"-"`
 }
 
 // GetAuthor 获取作者名称，兼容两种字段
@@ -160,6 +167,25 @@ func (h *BatchHandler) getConfig() *config.Config {
 func (h *BatchHandler) getDownloadsDir() (string, error) {
 	cfg := h.getConfig()
 	return cfg.GetResolvedDownloadsDir()
+}
+
+func (h *BatchHandler) batchResumeEnabled() bool {
+	cfg := h.getConfig()
+	if cfg == nil {
+		return true
+	}
+	return cfg.DownloadResumeEnabled
+}
+
+func (h *BatchHandler) cleanupTaskArtifacts(taskID, tempPath string, removeFiles bool) {
+	if h.gopeedService != nil && strings.TrimSpace(taskID) != "" {
+		if err := h.gopeedService.DeleteTask(taskID, removeFiles); err != nil && !strings.Contains(strings.ToLower(err.Error()), "task not found") {
+			utils.Warn("清理 Gopeed 任务失败: %v", err)
+		}
+	}
+	if removeFiles && strings.TrimSpace(tempPath) != "" {
+		_ = os.Remove(tempPath)
+	}
 }
 
 // HandleBatchStart 处理批量下载开始请求
@@ -254,6 +280,19 @@ func (h *BatchHandler) HandleBatchStart(Conn *SunnyNet.HttpConn) bool {
 	if len(req.Videos) == 0 {
 		h.sendErrorResponse(Conn, fmt.Errorf("视频列表为空"))
 		return true
+	}
+
+	h.mu.RLock()
+	busy := h.running || h.cancelFunc != nil
+	oldTasks := append([]BatchTask(nil), h.tasks...)
+	h.mu.RUnlock()
+
+	if busy {
+		h.sendErrorResponse(Conn, fmt.Errorf("已有批量下载任务正在进行或收尾中，请稍后再试"))
+		return true
+	}
+	for _, oldTask := range oldTasks {
+		h.cleanupTaskArtifacts(oldTask.GopeedTaskID, oldTask.TempPath, true)
 	}
 
 	// 初始化任务
@@ -390,6 +429,15 @@ func (h *BatchHandler) startBatchDownload(forceRedownload bool) {
 				err := h.downloadVideo(ctx, task, downloadsDir, forceRedownload, taskIdx)
 
 				h.mu.Lock()
+				if errors.Is(err, errBatchPaused) {
+					if task.Status == "downloading" {
+						task.Status = "pending"
+					}
+					task.Error = ""
+					h.mu.Unlock()
+					utils.Info("⏸️ [Worker %d] 已暂停: %s", workerID, task.Title)
+					continue
+				}
 				if err != nil {
 					task.Status = "failed"
 					task.Error = err.Error()
@@ -498,16 +546,16 @@ func (h *BatchHandler) downloadVideo(ctx context.Context, task *BatchTask, downl
 		SizeText:   task.SizeMB,
 	}, includeVideoID, filenameTemplate)
 	cleanFilename = utils.EnsureExtension(cleanFilename, ".mp4")
-	filePath := filepath.Join(savePath, cleanFilename)
-
-	if !forceRedownload {
-		if _, err := os.Stat(filePath); err == nil {
-			utils.Info("⏭️ [批量下载] 文件已存在，跳过: %s", cleanFilename)
-			// 文件已存在也保存记录（标记为已完成）
-			h.saveDownloadRecord(task, filePath, "completed")
-			return nil
+	desiredPath := task.FinalPath
+	if strings.TrimSpace(desiredPath) == "" {
+		desiredPath = filepath.Join(savePath, cleanFilename)
+		if !forceRedownload {
+			if _, err := os.Stat(desiredPath); err == nil {
+				desiredPath = utils.GenerateUniquePath(savePath, cleanFilename)
+				utils.Info("🪪 [批量下载] 同名文件已存在，将使用新文件名: %s", filepath.Base(desiredPath))
+			}
 		}
-		filePath = utils.GenerateUniquePath(savePath, cleanFilename)
+		task.FinalPath = desiredPath
 	}
 
 	// 使用配置的重试次数
@@ -524,7 +572,7 @@ func (h *BatchHandler) downloadVideo(ctx context.Context, task *BatchTask, downl
 		// 检查是否取消
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("下载已取消")
+			return errBatchPaused
 		default:
 		}
 
@@ -537,7 +585,7 @@ func (h *BatchHandler) downloadVideo(ctx context.Context, task *BatchTask, downl
 
 			select {
 			case <-ctx.Done():
-				return fmt.Errorf("下载已取消")
+				return errBatchPaused
 			case <-time.After(delay):
 			}
 		}
@@ -548,24 +596,22 @@ func (h *BatchHandler) downloadVideo(ctx context.Context, task *BatchTask, downl
 			timeout = h.getConfig().DownloadTimeout
 		}
 		downloadCtx, cancel := context.WithTimeout(ctx, timeout)
-		err := h.downloadVideoOnce(downloadCtx, task, filePath, taskIdx)
+		actualPath, err := h.downloadVideoOnce(downloadCtx, task, desiredPath, taskIdx)
 		cancel()
 
 		if err == nil {
 			// 下载成功，保存到下载记录数据库
-			h.saveDownloadRecord(task, filePath, "completed")
+			h.saveDownloadRecord(task, actualPath, "completed")
 			return nil
+		}
+		if errors.Is(err, errBatchPaused) || errors.Is(err, context.Canceled) {
+			return errBatchPaused
 		}
 
 		lastErr = err
 		utils.LogDownloadRetry(task.ID, task.Title, retry+1, maxRetries, err)
 		utils.Warn("⚠️ [批量下载] 下载失败 (尝试 %d/%d): %v", retry+1, maxRetries, err)
 
-		// 如果不支持断点续传或是加密视频，清理临时文件
-		resumeEnabled := h.getConfig() != nil && h.getConfig().DownloadResumeEnabled
-		if task.DecryptorPrefix != "" || !resumeEnabled {
-			os.Remove(filePath + ".tmp")
-		}
 	}
 
 	// 记录最终失败的详细错误
@@ -574,24 +620,22 @@ func (h *BatchHandler) downloadVideo(ctx context.Context, task *BatchTask, downl
 }
 
 // downloadVideoOnce 执行一次下载尝试（支持断点续传）
-func (h *BatchHandler) downloadVideoOnce(ctx context.Context, task *BatchTask, filePath string, taskIdx int) error {
+func (h *BatchHandler) downloadVideoOnce(ctx context.Context, task *BatchTask, desiredPath string, taskIdx int) (string, error) {
 	// 使用 Gopeed 下载
 	if h.gopeedService == nil {
-		return fmt.Errorf("Gopeed下载服务未初始化")
+		return "", fmt.Errorf("Gopeed下载服务未初始化")
 	}
 
 	// 开始下载
 	utils.Info("🚀 [批量下载] 使用 Gopeed 下载: %s", task.Title)
-
-	// 创建临时文件路径（Gopeed 会处理，这里我们只需要传递最终路径，
-	// 但 GopeedService.DownloadSync 还没有实现自动重命名？
-	// 让我们看看 GopeedService.DownloadSync 的实现。
-	// 它是直接调用 CreateDirect，并没有阻塞直到完成？
-	// 之前的 gopeed_service.go 实现是轮询状态直到 DownloadStatusDone。
-	// 所以是阻塞的。
-
-	// 注意：Gopeed 下载的临时文件名处理可能需要注意。
-	// 如果我们传递 filePath，Gopeed 会直接下载到那个路径（或所在目录）。
+	tmpHint := task.ID
+	if tmpHint == "" {
+		tmpHint = strconv.Itoa(taskIdx)
+	}
+	if strings.TrimSpace(task.TempPath) == "" {
+		task.TempPath = utils.BuildTempDownloadPath(desiredPath, tmpHint)
+	}
+	tmpPath := task.TempPath
 
 	onProgress := func(progress float64, downloaded int64, total int64) {
 		h.mu.Lock()
@@ -650,23 +694,109 @@ func (h *BatchHandler) downloadVideoOnce(ctx context.Context, task *BatchTask, f
 	}
 	utils.Info("🌐 [批量下载] 请求头: Referer=%s | UA=%s | 连接数=%d", headers["Referer"], headers["User-Agent"], connections)
 
-	err := h.gopeedService.DownloadSync(ctx, downloadURL, filePath, connections, headers, onProgress)
+	createTask := func() error {
+		_ = os.Remove(tmpPath)
+		taskID, err := h.gopeedService.CreateTask(downloadURL, tmpPath, connections, headers)
+		if err != nil {
+			return err
+		}
+		task.GopeedTaskID = taskID
+		return nil
+	}
+
+	if strings.TrimSpace(task.GopeedTaskID) == "" {
+		if err := createTask(); err != nil {
+			return "", err
+		}
+	} else if h.batchResumeEnabled() {
+		snapshot, err := h.gopeedService.GetTaskSnapshot(task.GopeedTaskID)
+		if err != nil {
+			utils.Warn("⚠️ [批量下载] 已丢失 Gopeed 任务，重新创建: %s - %v", task.Title, err)
+			h.cleanupTaskArtifacts(task.GopeedTaskID, tmpPath, true)
+			task.GopeedTaskID = ""
+			if err := createTask(); err != nil {
+				return "", err
+			}
+		} else {
+			switch snapshot.Status {
+			case base.DownloadStatusPause, base.DownloadStatusWait, base.DownloadStatusReady:
+				if err := h.gopeedService.ContinueTask(task.GopeedTaskID); err != nil {
+					return "", err
+				}
+			case base.DownloadStatusError:
+				h.cleanupTaskArtifacts(task.GopeedTaskID, tmpPath, true)
+				task.GopeedTaskID = ""
+				if err := createTask(); err != nil {
+					return "", err
+				}
+			}
+		}
+	}
+
+	actualPath, err := h.gopeedService.WaitTask(ctx, task.GopeedTaskID, onProgress)
 	if err != nil {
-		return err
+		if errors.Is(err, services.ErrTaskPaused) {
+			if actualPath == "" {
+				actualPath = tmpPath
+			}
+			return actualPath, errBatchPaused
+		}
+		if errors.Is(err, context.Canceled) {
+			if actualPath == "" {
+				actualPath = tmpPath
+			}
+			if !h.batchResumeEnabled() {
+				h.cleanupTaskArtifacts(task.GopeedTaskID, tmpPath, true)
+				task.GopeedTaskID = ""
+				task.TempPath = ""
+			}
+			return actualPath, errBatchPaused
+		}
+		h.cleanupTaskArtifacts(task.GopeedTaskID, tmpPath, true)
+		task.GopeedTaskID = ""
+		task.TempPath = ""
+		return "", err
+	}
+	if actualPath == "" {
+		actualPath = tmpPath
+	}
+
+	stat, err := os.Stat(actualPath)
+	if err != nil || stat.Size() == 0 {
+		h.cleanupTaskArtifacts(task.GopeedTaskID, actualPath, true)
+		task.GopeedTaskID = ""
+		return "", fmt.Errorf("下载文件无效")
 	}
 
 	// 解密逻辑（如果需要）
 	needDecrypt := task.Key != "" || (task.DecryptorPrefix != "" && task.PrefixLen > 0)
 	if needDecrypt {
 		utils.Info("🔐 [批量下载] 开始解密视频...")
-		// 原地解密（不需要额外的临时文件，因为 gopeed 已经下载了完整文件）
-		if err := utils.DecryptFileInPlace(filePath, task.GetKey(), task.DecryptorPrefix, task.PrefixLen); err != nil {
-			return fmt.Errorf("解密失败: %v", err)
+		if err := utils.DecryptFileInPlace(actualPath, task.GetKey(), task.DecryptorPrefix, task.PrefixLen); err != nil {
+			h.cleanupTaskArtifacts(task.GopeedTaskID, actualPath, true)
+			task.GopeedTaskID = ""
+			return "", fmt.Errorf("解密失败: %v", err)
 		}
 		utils.Info("✓ [批量下载] 解密完成")
 	}
 
-	return nil
+	finalPath, err := utils.MoveFileToAvailablePath(actualPath, desiredPath)
+	if err != nil {
+		h.cleanupTaskArtifacts(task.GopeedTaskID, actualPath, true)
+		task.GopeedTaskID = ""
+		return "", fmt.Errorf("移动文件失败: %v", err)
+	}
+	if finalPath != desiredPath {
+		utils.Warn("📁 [批量下载] 目标文件已存在，已自动保存为: %s", filepath.Base(finalPath))
+	}
+	if err := h.gopeedService.DeleteTask(task.GopeedTaskID, false); err != nil && !strings.Contains(strings.ToLower(err.Error()), "task not found") {
+		utils.Warn("清理 Gopeed 任务失败: %v", err)
+	}
+	task.GopeedTaskID = ""
+	task.TempPath = ""
+	task.FinalPath = finalPath
+
+	return finalPath, nil
 }
 
 func cloneStringMap(src map[string]string) map[string]string {
@@ -935,21 +1065,33 @@ func (h *BatchHandler) HandleBatchCancel(Conn *SunnyNet.HttpConn) bool {
 	}
 
 	h.mu.Lock()
-	if h.running && h.cancelFunc != nil {
-		h.cancelFunc() // 立即取消所有正在进行的下载
+	cancel := h.cancelFunc
+	resumeEnabled := h.batchResumeEnabled()
+	taskIDs := make([]string, 0)
+	if h.running && cancel != nil {
 		h.running = false
-
-		// 将正在下载的任务状态更新为 pending（表示已取消，但保留在列表中）
-		// 这样前端可以通过 running=0 判断下载已取消
-		// 注意：保留进度以支持断点续传
 		for i := range h.tasks {
 			if h.tasks[i].Status == "downloading" {
 				h.tasks[i].Status = "pending"
-				// 不重置进度，保留已下载的进度以支持断点续传
+				h.tasks[i].Error = ""
+				if resumeEnabled && strings.TrimSpace(h.tasks[i].GopeedTaskID) != "" {
+					taskIDs = append(taskIDs, h.tasks[i].GopeedTaskID)
+				}
 			}
 		}
 	}
 	h.mu.Unlock()
+
+	if resumeEnabled {
+		for _, taskID := range taskIDs {
+			if err := h.gopeedService.PauseTask(taskID); err != nil && !strings.Contains(strings.ToLower(err.Error()), "task not found") {
+				utils.Warn("暂停 Gopeed 任务失败: %v", err)
+			}
+		}
+	}
+	if cancel != nil {
+		cancel()
+	}
 
 	utils.Info("⏹️ [批量下载] 用户取消下载")
 
@@ -1072,8 +1214,8 @@ func (h *BatchHandler) HandleBatchResume(Conn *SunnyNet.HttpConn) bool {
 	}
 
 	// 如果已经在运行，返回错误
-	if h.running {
-		h.sendErrorResponse(Conn, fmt.Errorf("下载正在进行中，无法继续"))
+	if h.running || h.cancelFunc != nil {
+		h.sendErrorResponse(Conn, fmt.Errorf("下载正在进行中或上一轮仍在收尾，无法继续"))
 		return true
 	}
 
@@ -1125,20 +1267,38 @@ func (h *BatchHandler) HandleBatchClear(Conn *SunnyNet.HttpConn) bool {
 	}
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	// 如果正在运行，先取消
-	if h.running && h.cancelFunc != nil {
-		h.cancelFunc()
+	cancel := h.cancelFunc
+	busy := h.running || h.cancelFunc != nil
+	if h.running && cancel != nil {
 		h.running = false
 	}
+	h.mu.Unlock()
 
-	// 清除所有任务
+	if busy && cancel != nil {
+		cancel()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			h.mu.RLock()
+			stillBusy := h.running || h.cancelFunc != nil
+			h.mu.RUnlock()
+			if !stillBusy {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	h.mu.Lock()
+	oldTasks := append([]BatchTask(nil), h.tasks...)
 	taskCount := len(h.tasks)
 	h.tasks = nil
-	h.cancelFunc = nil
+	h.mu.Unlock()
 
 	utils.Info("🗑️ [批量下载] 已清除所有任务（%d 个）", taskCount)
+
+	for _, oldTask := range oldTasks {
+		h.cleanupTaskArtifacts(oldTask.GopeedTaskID, oldTask.TempPath, true)
+	}
 
 	h.sendSuccessResponse(Conn, map[string]interface{}{
 		"message": "任务已清除",
